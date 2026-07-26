@@ -1,0 +1,65 @@
+# Build and dependency output
+/build/
+*.o
+*.d
+*.elf
+*.map
+*.lst
+*.sym
+
+# Generated source and asset products
+/generated/
+/src/generated/
+/src/gfx/
+/src/iwad/
+!/assets/
+!/assets/doom256.png
+!/assets/font_recon.png
+!/assets/stbar.png
+
+# Disc images, CDDA tracks, and packaged releases
+/*.bin
+/*.cue
+/*.iso
+/*.img
+/*.chd
+/*.toc
+/*.m3u
+/*.zip
+/*.7z
+/*.rar
+/out.bin
+
+# User-supplied game data and audio
+*.wad
+*.WAD
+*.lmp
+*.deh
+*.bex
+/*.wav
+/*.aif
+/*.aiff
+/*.aifc
+/*.flac
+/*.mp3
+/*.ogg
+
+# Emulator state, captures, and diagnostics
+*.mcr
+*.sav
+*.state
+*.ram
+*.ppm
+*.y4m
+*.mkv
+*.mp4
+*.log
+
+# Locally built host tools and caches
+/tools/pcfx-cdlink
+/tools/pcfxtools/pcfx-cdlink
+/tools/pcfxtools/*.o
+__pycache__/
+*.py[cod]
+.vexp/
+.cache/
