@@ -18,7 +18,13 @@ void pcfx_wad_read(unsigned sector_off, void *buf, unsigned bytes);
  * modes fail. `what` names the requester in the fatal message ("WAD", "MAP PACK"). */
 void pcfx_cd_read_ram(const char *what, unsigned lba, void *buf, unsigned bytes);
 
-/* "DMA" / "PIO" / "PROBING" — which CD->RAM mode the fallback has settled on. */
+/* The loader starts in safe PIO for the self-validating IWAD header.  Once that
+ * establishes the checksum tables, enable the fast DMA bounce.  Any checksum
+ * rejection calls force_pio(), which is sticky for the rest of the run. */
+void pcfx_cd_ram_enable_fast(void);
+void pcfx_cd_ram_force_pio(void);
+
+/* "DMA" / "PIO" — which CD->RAM mode the fallback has settled on. */
 const char *pcfx_cd_ram_mode_name(void);
 
 #endif

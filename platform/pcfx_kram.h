@@ -76,15 +76,23 @@
  *                            a constant 0x5555 pattern ("UU..") - the open-bus
  *                            signature of the dotted expansion half that only
  *                            4-Mbit mode populates.
- * The scratch stays at 0xF800 anyway: it is the address class cdtest
- * CRC-validated on this console, it is valid in BOTH modes, and it sits in the
- * DEAD TAIL of framebuffer BUFFER 1 (every full-screen buffer uses only rows
- * 0..239 of its 256-row 0x8000-word slot; words 0x8000+0x7800 .. 0xFFFF are
- * never displayed, never rendered, never streamed - pcfx_cdasset.c moves
- * exactly 128x240 words). Keeping it mode-independent means a build that somehow
- * fails to take 4-Mbit mode degrades instead of returning garbage WAD data. */
+ * Keep this small, page-0 window for the CD matrix diagnostic. */
 #define KRAM_CD_DMA_SCRATCH_WORD   0x0F800u
 #define KRAM_CD_DMA_SCRATCH_WORDS  0x00400u
+
+/* Production CD -> RAM bounce window.
+ *
+ * Page 1 bank B is otherwise unused: RAINBOW and ADPCM occupy bank A, while
+ * every framebuffer/background buffer is on page 0.  A whole bank is one
+ * legal non-wrapping KRAM run (C6272_1 1.3), so it gives eris_cd_read_dma a
+ * 256 KiB window instead of the diagnostic's 2 KiB tail.  The rebuilt
+ * count-0 bounce issues one READ(10) per window: a 500-700 KiB map therefore
+ * needs 2-3 consecutive commands instead of one command PER SECTOR.
+ *
+ * D31 selects page 1 for the CPU KRAM cursor only.  REG.09 receives the
+ * within-page 0x20000 bank-B address; REG.0F's SCP bit routes SCSI to page 1. */
+#define KRAM_CD_RAM_SCRATCH_WORD   0x80020000u
+#define KRAM_CD_RAM_SCRATCH_WORDS  0x00020000u
 
 /* Number of gameplay framebuffers. Buffer 2 exists so the presenter can defer
  * the vsync page flip: frame N+1 renders into the third buffer while frame N

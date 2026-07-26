@@ -63,66 +63,49 @@ void pcfx_cd_account(unsigned lba, unsigned nsect)
     eris_cdda_notify_cd_read();
 }
 
-/* ---- CD -> RAM: CPU-PIO by default, DMA only as a last resort --------------
+/* ---- CD -> RAM: verified large-window DMA, sticky CPU-PIO fallback --------
  *
  * CD -> system RAM is the correctness-critical path: it carries the WAD header,
  * the lump directory and the map-pack index, and a single wrong word there does
  * not look like a read failure, it looks like a corrupt game
  * ("W_GetNumForName: TEXTURE1 not found").
  *
- * There is no DMA engine to system RAM, so the "fast" path is a bounce: SCSI
- * DMA into a KRAM scratch window, then a CPU copy-out of that window. That
- * makes it strictly WORSE than plain PIO on this console, on two counts.
+ * There is no DMA engine straight to system RAM, so the fast path bounces
+ * through the otherwise-unused 256 KiB page-1/bank-B KRAM run.  Hudson
+ * C6272_2 3.3.1 rates the asynchronous SCSI path at 1.5 MB/s; 3.2.2 says a
+ * lower-priority CPU KRAM request is HELD until it wins arbitration, not lost.
+ * The old 2 KiB bounce squandered that path by issuing one READ(10) per sector.
  *
- *   1. The DMA half is the count-0 arm, which two hardware burns put at 3 of 6.
- *   2. The copy-out half is a tight CPU loop on the KRAM data port, and
- *      C6272_2 3.2.2 ranks the CPU LAST on the K-BUS -- so it can lose words
- *      even when the DMA was perfect.
+ * DMA is still not trusted blindly.  W_Init reads the self-checking header by
+ * the silicon-proven CPU-PIO path, and only then enables DMA.  Every generated
+ * WAD/map-pack region is checksum-verified by w_wad.c; the first mismatch
+ * calls pcfx_cd_ram_force_pio(), repairs through PIO/duplicate media, and
+ * permanently leaves the run on the safe path.  This avoids the old one-shot
+ * probe failure: DMA must keep agreeing with build-time truth on EVERY read.
  *
- * eris_cd_read() has neither half: the CPU pumps the SCSI data register
- * straight into RAM and never touches KRAM at all. It is the only path with an
- * unbroken record on this console (4 of 4 across both burns) and the one that
- * has always progressed deep into boot.
- *
- * WHY THIS IS NOT A PROBE ANY MORE. It used to be: read the first request
- * through BOTH paths, compare checksums, and make the winner sticky. That is
- * what regressed the 2026-07-24 22:00 burn. Rebuilding eris_cd_read_dma on
- * count-0 arms made DMA good enough to WIN the one-shot comparison, after
- * which it stuck for the whole run and silently corrupted a later read -- the
- * fatal TEXTURE1 photo, taken with "CD MODE DMA" on the panel. One agreement
- * is not evidence about a path that works most of the time; a 50/50 path that
- * passes a single trial and is then trusted forever is worse than no DMA.
- *
- * So DMA is now only the LAST-DITCH swap if PIO itself fails, and libpcfx
- * verifies every DMA destination before reporting success (see
- * eris_cd_read_kram). EXTRA=-DPCFX_CD_TRY_DMA restores the probe for anyone
- * measuring the DMA path on hardware. */
-#define CD_MODE_UNDECIDED 0
+ * The full DMA call is interrupt-atomic.  Its copy-out owns KING's KRAM read
+ * cursor, and a timer IRQ between register select/data accesses is a
+ * silicon-observed corruption source.  Loading is already blocking, and the
+ * PIO implementation likewise pauses the timer for its command. */
 #define CD_MODE_DMA       1
 #define CD_MODE_PIO       2
-#ifdef PCFX_CD_TRY_DMA
-/* Debug knob: probe DMA against PIO on the first read and make the winner
- * sticky, the pre-22:00 behaviour. For measurement only -- see above for why
- * this is not what ships. */
-static int s_cd_ram_mode = CD_MODE_UNDECIDED;
-#else
 static int s_cd_ram_mode = CD_MODE_PIO;
-#endif
-
-/* Attempt budget for a mode PROBE (fast verdict) vs an established mode. */
-#define CD_PROBE_ATTEMPTS 4
-#define CD_FULL_ATTEMPTS  40
+static int s_cd_fast_enabled;
+static int s_cd_dma_rejected;
 
 static int cd_ram_try_dma(unsigned lba, void *buf, unsigned bytes)
 {
-    /* Route SCSI (and the CPU KRAM read port) to page 0 for the bounce.
-     * Interrupt-atomic: this is a KING select+data sequence issued with the
-     * timer IRQ live (libpcfx pauses the timer only INSIDE eris_cd_*). */
+    int ok;
+    /* Route SCSI to page 1, where bank B is the dedicated 256 KiB bounce.
+     * Keep the complete DMA + CPU copy-out atomic: both use shared KING
+     * register/cursor state which the 1 ms timer ISR must not interrupt. */
     uint32_t psw = pcfx_irq_save();
-    king_set_kram_pages(0, 0, 1, 1);
+    king_set_kram_pages(1, 0, 1, 1);
+    ok = eris_cd_read_dma(lba, (unsigned char *)buf, bytes,
+                          KRAM_CD_RAM_SCRATCH_WORD,
+                          KRAM_CD_RAM_SCRATCH_WORDS);
     pcfx_irq_restore(psw);
-    return eris_cd_read_dma(lba, (unsigned char *)buf, bytes,
-                            KRAM_CD_DMA_SCRATCH_WORD, KRAM_CD_DMA_SCRATCH_WORDS);
+    return ok;
 }
 
 static int cd_ram_try_pio(unsigned lba, void *buf, unsigned bytes)
@@ -133,18 +116,27 @@ static int cd_ram_try_pio(unsigned lba, void *buf, unsigned bytes)
 const char *pcfx_cd_ram_mode_name(void)
 {
     if (s_cd_ram_mode == CD_MODE_DMA) return "DMA";
-    if (s_cd_ram_mode == CD_MODE_PIO) return "PIO";
-    return "PROBING";
+    return "PIO";
 }
 
-/* Order-independent byte checksum (FNV-1a) for the probe's DMA-vs-PIO data
- * comparison below. */
-static unsigned cd_ram_sum(const unsigned char *p, unsigned n)
+void pcfx_cd_ram_enable_fast(void)
 {
-    unsigned h = 2166136261u;
-    while (n--)
-        h = (h ^ *p++) * 16777619u;
-    return h;
+#ifndef PCFX_CD_FORCE_PIO
+    s_cd_fast_enabled = 1;
+    if (!s_cd_dma_rejected)
+    {
+        s_cd_ram_mode = CD_MODE_DMA;
+        pcfx_boot_progress_set_note("CD MODE DMA VERIFY");
+    }
+#endif
+}
+
+void pcfx_cd_ram_force_pio(void)
+{
+    if (s_cd_ram_mode == CD_MODE_DMA)
+        pcfx_boot_progress_set_note("CD DMA BAD - PIO");
+    s_cd_dma_rejected = 1;
+    s_cd_ram_mode = CD_MODE_PIO;
 }
 
 void pcfx_cd_read_ram(const char *what, unsigned lba, void *buf, unsigned bytes)
@@ -152,57 +144,19 @@ void pcfx_cd_read_ram(const char *what, unsigned lba, void *buf, unsigned bytes)
     unsigned nsect = (bytes + 2047u) / 2048u;
     int ok;
 
-    if (s_cd_ram_mode == CD_MODE_PIO) {
-        ok = cd_ram_try_pio(lba, buf, bytes);
-        if (!ok)
-            ok = cd_ram_try_dma(lba, buf, bytes);   /* last-ditch mode swap */
-    } else if (s_cd_ram_mode == CD_MODE_UNDECIDED) {
-        /* PROBE: decide the mode on this machine. SCSI status alone is NOT
-         * enough — the 2026-07-24 hardware burn returned GOOD status from the
-         * DMA path while the KRAM bounce delivered a constant open-bus
-         * pattern to RAM ("W_INIT: CD IWAD ID MISSING (GOT UU..)"), so the
-         * status-only probe locked in a corrupt mode. Now the probe reads the
-         * same sectors through BOTH paths and compares checksums: only
-         * DMA-with-PIO-agreement selects DMA. On any disagreement (or DMA
-         * failure) the PIO copy — CPU-direct from the SCSI data register, no
-         * KRAM involved — is what's left in the buffer and PIO becomes the
-         * sticky mode. Costs one duplicate read of the first request only. */
-        unsigned dma_sum = 0;
-        int dma_ok;
-        eris_cd_set_attempts(CD_PROBE_ATTEMPTS);
-        dma_ok = cd_ram_try_dma(lba, buf, bytes);
-        eris_cd_set_attempts(CD_FULL_ATTEMPTS);
-        if (dma_ok)
-            dma_sum = cd_ram_sum((const unsigned char *)buf, bytes);
-
-        ok = cd_ram_try_pio(lba, buf, bytes);
-        if (ok && dma_ok &&
-            dma_sum == cd_ram_sum((const unsigned char *)buf, bytes)) {
-            s_cd_ram_mode = CD_MODE_DMA;   /* both agree: DMA is fast + valid */
-            pcfx_boot_progress_set_note("CD MODE DMA");
-        } else if (ok) {
-            /* PIO data stands (DMA failed or disagreed) — PIO is the mode. */
-            s_cd_ram_mode = CD_MODE_PIO;
-            pcfx_boot_progress_set_note(dma_ok ? "CD DMA BAD DATA"
-                                               : "CD MODE PIO");
-        } else if (dma_ok) {
-            /* PIO itself failed on this machine; DMA (unverified) is all we
-             * have. Re-fetch so the buffer holds DMA data, and say so. */
-            ok = cd_ram_try_dma(lba, buf, bytes);
-            if (ok) {
-                s_cd_ram_mode = CD_MODE_DMA;
-                pcfx_boot_progress_set_note("CD PIO FAILED");
-            }
-        }
-    } else {
+    if (s_cd_ram_mode == CD_MODE_DMA) {
         ok = cd_ram_try_dma(lba, buf, bytes);
         if (!ok) {
+            pcfx_cd_ram_force_pio();
             ok = cd_ram_try_pio(lba, buf, bytes);
-            if (ok) {
-                s_cd_ram_mode = CD_MODE_PIO;        /* sticky fallback */
-                pcfx_boot_progress_set_note("CD MODE PIO");
-            }
         }
+    } else {
+        ok = cd_ram_try_pio(lba, buf, bytes);
+        /* Last ditch only: if the safe path cannot read at all, DMA is better
+         * than an immediate fatal error.  It remains rejected/sticky-PIO for
+         * subsequent calls and its caller still checksum-validates the data. */
+        if (!ok && s_cd_fast_enabled)
+            ok = cd_ram_try_dma(lba, buf, bytes);
     }
 
     if (!ok) {

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Still has a lot of problems on real hardware, TO BE FIXED
 """Encode 256x240 PNG backgrounds into PC-FX RAINBOW YUV/DCT streams."""
 
 import argparse

@@ -133,6 +133,27 @@ static int          w_pc_nseq;     /* order): the arena RESERVES slots in this o
                                    /* lump fill did; bytes are then read in DISC order */
                                    /* (coalesced) — see W_PrecacheEnd.                 */
 
+#if defined(GEN_MAPPACK_MANIFEST) || defined(GEN_BOOTPACK_MANIFEST)
+/* Binary handoff for tools/gen_mappack_manifest.sh. The old generator scraped
+ * printf output from the serial RAM log, but that log no longer exists. Reuse
+ * the already-allocated sequence array and expose only its pointer/count plus a
+ * marker and map name, adding 24 bytes instead of restoring a large log ring. */
+static struct {
+    char marker[8];
+    char map[8];
+    unsigned n;
+    const int *seq;
+} w_manifest_dump = { {'P','C','F','X','M','M','F','!'}, {0}, 0, NULL };
+
+static void w_manifest_publish(const char *map, const int *seq, unsigned n)
+{
+    memset(w_manifest_dump.map, 0, sizeof(w_manifest_dump.map));
+    strncpy(w_manifest_dump.map, map, sizeof(w_manifest_dump.map));
+    w_manifest_dump.seq = seq;
+    w_manifest_dump.n = n;
+}
+#endif
+
 /* Set once precache is done and gameplay has started: any CD read taken after
  * this point is a PRECACHE MISS (an asset the level uses that we failed to pull
  * resident) — the whole point of this cache is that gameplay never touches the
@@ -294,6 +315,10 @@ static int cd_read_checked(void (*rd)(unsigned, void *, unsigned), unsigned dup,
 {
     rd(sec, buf, bytes);
     if (!bad(buf, c)) return 1;
+    /* A completed DMA with bad bytes is exactly the silicon failure the safe
+     * fallback exists for.  Latch to CPU-PIO BEFORE repair reads; do not let
+     * one lucky probe make DMA trusted for the rest of the run. */
+    pcfx_cd_ram_force_pio();
     if (dup)
     {
         rd(sec + dup, buf, bytes);                      /* the disc's second copy */
@@ -498,6 +523,12 @@ void W_Init(void)
     const wadinfo_t *header = (const wadinfo_t *)hdrsec;
     if (strncmp(header->identification, "IWAD", 4))
         I_Error("W_Init: CD IWAD id missing (got %.4s)", header->identification);
+
+    /* The header arrived through safe PIO and authenticates every generated
+     * region used below.  Only now may the large-window DMA path run.  Legacy
+     * blobs without DUP1/checksums remain entirely on PIO. */
+    if (have_sums)
+        pcfx_cd_ram_enable_fast();
 
     w_numlumps = LONG(header->numlumps);
     unsigned dirofs = (unsigned)LONG(header->infotableofs);   // sector-aligned
@@ -903,6 +934,7 @@ static const byte *w_pack_index_load(void)
     unsigned cand = mp_u32(buf + 8);                   /* mirror offset candidate */
     if (!pack_index_ok(buf))
     {
+        pcfx_cd_ram_force_pio();
         pcfx_mappack_read(1, buf, SECTOR);             /* the duplicate index sector */
         int ok = pack_index_ok(buf);
         if (ok)
@@ -1264,22 +1296,24 @@ static int w_arena_reserve(int lump)
 void W_PrecacheEnd(void)
 {
 #ifdef GEN_MAPPACK_MANIFEST
-    // Manifest gen: dump the FULL MARKED set (the authoritative per-map asset list) in
-    // PRIORITY + call order — this is what the offline pack builder packs, and the pack
-    // sizes chunk0 to hold all of it, so nothing is dropped. No arena fill happens here.
+    // Manifest gen: publish the FULL MARKED set (the authoritative per-map asset
+    // list) in PRIORITY + call order. Stable insertion sort keeps call order
+    // within each priority without allocating a second sequence array.
     if (w_pc_mark && w_pc_seq)
     {
         const char *mn = (w_pc_maplump >= 0) ? w_dir[w_pc_maplump].name : "????????";
-        int n = 0;
-        for (int k = 0; k < w_numlumps; k++) if (w_pc_mark[k]) n++;
-        lprintf(LO_INFO, "MAPPACK %.8s %d", mn, n);
-        for (int prio = W_PC_FLAT; prio >= W_PC_EFFECT; prio--)
-            for (int s = 0; s < w_pc_nseq; s++)
+        for (int i = 1; i < w_pc_nseq; i++)
+        {
+            int key = w_pc_seq[i];
+            int j = i;
+            while (j > 0 && w_pc_mark[w_pc_seq[j - 1]] < w_pc_mark[key])
             {
-                int L = w_pc_seq[s];
-                if (w_pc_mark[L] == prio)
-                    lprintf(LO_INFO, "MP %d %.8s", L, w_dir[L].name);
+                w_pc_seq[j] = w_pc_seq[j - 1];
+                j--;
             }
+            w_pc_seq[j] = key;
+        }
+        w_manifest_publish(mn, w_pc_seq, (unsigned)w_pc_nseq);
     }
     return;
 #endif
@@ -1531,6 +1565,7 @@ int W_LoadMapPack(void)
         // one bad sprite. Instead each bad lump is re-read on its own (a few KB, via
         // w_stage) from the duplicate copy, and only what no copy can supply is
         // un-reserved so the renderer draws nothing for it rather than garbage.
+        int bulk_dma_bad = 0;
         for (unsigned k = n_geo; k < nlumps; k++)
         {
             unsigned lumpnum = PK_LUMP(hdr, k);
@@ -1538,6 +1573,11 @@ int W_LoadMapPack(void)
             byte *dst = w_arena[0] + (poff - gfx_first);
             if (lumpnum >= (unsigned)w_numlumps || !w_comp[lumpnum]) continue;
             if (pack_lump_ok(hdr, k, dst)) continue;
+            if (!bulk_dma_bad)
+            {
+                pcfx_cd_ram_force_pio();
+                bulk_dma_bad = 1;
+            }
             unsigned floor_poff = poff & ~(SECTOR - 1u);
             unsigned span = poff + dlen - floor_poff;
             if (round_sectors(span) <= w_stage_bytes &&
@@ -1780,23 +1820,16 @@ void W_LoadBootPack(void)
     lprintf(LO_INFO, "W_LoadBootPack: %u boot lumps resident", nlumps);
 }
 
-// -DGEN_BOOTPACK_MANIFEST only: dump the captured boot-resident set (see the capture
-// in W_CacheLumpNum) as a `MAPPACK BOOT n` block + `MP <num> <name>` lines — the same
-// serial-log format the per-map dump uses, so gen_mappack_manifest.sh's extractor and
-// gen_pcfx_packs.py consume it with no special-casing. Dumps once, at the first title
-// frame (D_Display), by which point every boot lump — including TITLEPIC — was touched.
+// -DGEN_BOOTPACK_MANIFEST only: publish the captured boot-resident set (see
+// W_CacheLumpNum) once, at the first title frame. By then every boot lump,
+// including TITLEPIC, was touched.
 void W_BootManifestDump(void)
 {
 #ifdef GEN_BOOTPACK_MANIFEST
     if (w_boot_dumped || !w_boot_seq) return;
     w_boot_dumped = 1;
     w_boot_capturing = 0;
-    lprintf(LO_INFO, "MAPPACK %s %d", "BOOT", w_boot_nseq);
-    for (int s = 0; s < w_boot_nseq; s++)
-    {
-        int L = w_boot_seq[s];
-        lprintf(LO_INFO, "MP %d %.8s", L, w_dir[L].name);
-    }
+    w_manifest_publish("BOOT", w_boot_seq, (unsigned)w_boot_nseq);
 #else
     (void)0;
 #endif

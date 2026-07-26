@@ -21,6 +21,7 @@ CDLINK    ?= ./tools/pcfxtools/pcfx-cdlink
 
 TARGET    := doom_pcfx
 OBJDIR    := build
+CONVERTER_BASE := final_converter/doom_pcfx_port_base.dpf
 
 # libpcfx (successor to liberis, r20-safe SCSI + fast delays) is the platform
 # library now.  Keep it in-tree so projects which still need liberis are
@@ -58,9 +59,27 @@ CFLAGS    := -O2 -fomit-frame-pointer -fno-builtin -ffunction-sections \
 
 # Link with v810-ld directly: toolchain crt0.o first, default v810.x script
 # (load 0x8000, heap up to 2 MB), then --gc-sections to drop unused engine code.
+# These offsets are cache indices within the 1 KiB-aligned renderer section.
+# They are deliberately build knobs: after changing a hot function, inspect the
+# result with `make pcfx-hot-layout` and re-benchmark candidate placements without
+# editing C or the linker script.  The script retains the measured defaults.
+PCFX_HOT_RENDERSEG_OFFSET     ?= 0x200
+PCFX_HOT_SPAN_LIT_OFFSET      ?= 0xa40
+PCFX_HOT_COLUMN_LIT_OFFSET    ?= 0xb04
+PCFX_HOT_WALL_DISPATCH_OFFSET ?= 0xda0
+PCFX_HOT_CORE_END_OFFSET      ?= 0x10e0
+PCFX_HOT_SPAN32_OFFSET        ?= 0x1454
+PCFX_HOT_LAYOUT_LDFLAGS := \
+             --defsym=__pcfx_renderseg_offset=$(PCFX_HOT_RENDERSEG_OFFSET) \
+             --defsym=__pcfx_span_lit_offset=$(PCFX_HOT_SPAN_LIT_OFFSET) \
+             --defsym=__pcfx_column_lit_offset=$(PCFX_HOT_COLUMN_LIT_OFFSET) \
+             --defsym=__pcfx_walldispatch_offset=$(PCFX_HOT_WALL_DISPATCH_OFFSET) \
+             --defsym=__pcfx_hot_core_end_offset=$(PCFX_HOT_CORE_END_OFFSET) \
+             --defsym=__pcfx_span32_offset=$(PCFX_HOT_SPAN32_OFFSET)
 LDFLAGS   := -L$(LIBPCFX) \
              -L$(V810)/lib -L$(V810)/v810/lib -L$(V810)/lib/gcc/v810/4.9.4 \
              -T platform/pcfx_hot.ld \
+             $(PCFX_HOT_LAYOUT_LDFLAGS) \
              $(V810)/v810/lib/crt0.o --gc-sections \
              --undefined=_pcfx_r_subsector_layout_pad
 # crt0.o is byte-identical between liberis and libpcfx, so the toolchain copy is
@@ -107,8 +126,12 @@ ELF       := $(OBJDIR)/$(TARGET).elf
 BIN       := $(TARGET).bin
 MAP       := $(OBJDIR)/$(TARGET).map
 
-.PHONY: all cd zip clean
+.PHONY: all cd zip clean pcfx-hot-layout dbf dpf
 all: cd
+
+pcfx-hot-layout:
+	@test -f $(ELF) || { echo "build $(ELF) first" >&2; exit 1; }
+	python3 tools/pcfx_hot_layout.py --elf $(ELF)
 
 # --- Build identity stamp ----------------------------------------------------
 # Every hardware photo must be attributable to an exact build: two 2026-07-24
@@ -388,6 +411,12 @@ cd: out.bin cdlink.txt $(CDLINK) $(SKY_BIN) $(SFX_BIN) $(CDA_BIN) $(CDWAD_BIN) $
 	$(MAKE) out.bin
 	$(CDLINK) cdlink.txt $(TARGET)
 	@echo "built $(TARGET).cue / $(TARGET).bin  (program $$(stat -c%s $(BIN)) bytes, $(words $(CDDA_WAVS)) CD-DA tracks)"
+
+# Browser converter base. "dbf" is kept as the convenient/user-facing command;
+# the format consumed by final_converter/index.html is named .dpf.
+dbf dpf: cd tools/make_pcfx_converter_base.py
+	python3 tools/make_pcfx_converter_base.py \
+	  --cue $(TARGET).cue --output $(CONVERTER_BASE)
 
 zip: cd
 	zip -j DoomPCFX_build.zip $(TARGET).cue $(TARGET).bin $(TARGET)_t*.bin $(TARGET)_SONG*.bin

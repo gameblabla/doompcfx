@@ -4142,18 +4142,9 @@ R_PrepareGenericSegTextureColumn(unsigned int texture, const texture_t *tex,
 #define HEIGHTBITS 12
 #define HEIGHTUNIT (1<<HEIGHTBITS)
 
-/* With inline ABI prologues, R_RenderSegLoop's generated per-column body is
- * 950 bytes (V810 GCC 4.9.4), from function offset 0x1e0 through 0x594.  The
- * V810 instruction cache is a
- * direct-mapped 1 KiB window; arbitrary placement makes that backward loop
- * cross a cache boundary and evict its own first instructions every column.
- * Start the function at +0x220 within an aligned window so the loop begins at
- * the next 1 KiB boundary and fits wholly inside it.  The padding is never
- * executed and this named section keeps the relationship stable at link time. */
-__asm__(".section .pcfx_renderseg,\"ax\"\n"
-        ".balign 1024\n"
-        ".space 0x21e\n" /* assembler rounds the function itself to +0x220 */
-        ".previous\n");
+/* This function's cache slot is controlled by PCFX_HOT_RENDERSEG_OFFSET in the
+ * Makefile/linker script.  pcfx_hot_layout.py finds the generated backwards
+ * branch, so placement no longer relies on stale hand-counted body offsets. */
 static __attribute__((noinline,hot,section(".pcfx_renderseg")))
 void R_RenderSegLoop (int rw_x)
 {
@@ -4212,8 +4203,8 @@ void R_RenderSegLoop (int rw_x)
     // rw_x = start, rw_stopx = stop+1, and a stored seg always has start <= stop,
     // so this loop always runs at least once -> bottom-tested do/while drops the
     // compiler's initial entry guard branch. (cf. d32xr b89de43)
-    /* Keep the measured backwards-branch target at function offset 0x1c4;
-     * changing this instruction perturbs the dispatcher's caller overlap. */
+    /* Keep the measured instruction stream stable; the layout audit discovers
+     * the actual backwards-branch target directly from the linked disassembly. */
     __asm__ volatile ("nop");
     do
     {

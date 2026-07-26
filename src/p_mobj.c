@@ -818,12 +818,21 @@ void P_SpawnMapThing (const mapthing_t* mthing)
     if (options & MTF_NOTSINGLE)
         return;
 
+    // A production map pack must contain the union of sprites used by every
+    // single-player difficulty. Manifest generation therefore spawns every
+    // thing that belongs to at least one skill; the run ends after precaching,
+    // before overlapping difficulty variants could affect gameplay.
+#ifdef GEN_MAPPACK_MANIFEST
+    if (!(options & (MTF_EASY | MTF_NORMAL | MTF_HARD)))
+        return;
+#else
     // killough 11/98: simplify
     if (_g->gameskill == sk_baby || _g->gameskill == sk_easy ?
             !(options & MTF_EASY) :
             _g->gameskill == sk_hard || _g->gameskill == sk_nightmare ?
             !(options & MTF_HARD) : !(options & MTF_NORMAL))
         return;
+#endif
 
     // find which type to spawn
 
