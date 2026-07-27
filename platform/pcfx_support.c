@@ -20,16 +20,16 @@
  * register, and its VD (0x20) bit "remains latched under pcfxemu" once the VDC
  * is initialised (see the PCFX3Dproject reference) — polling it after the weapon
  * VDCs come up froze this port's frame timer and hung the game loop.  The tetsu
- * raster is independent of VDC state.  Active display is lines 0..239 in the
- * 262-line mode; vblank is raster >= 240. */
-#define PCFX_VBLANK_RASTER 240
-static inline int pcfx_in_vblank(void)
-{
-    /* Stable double-read: a single raw tetsu_get_raster() can latch a
-     * bogus transitional value (Tetsu HW bug), which would flip this predicate
-     * at the wrong scanline and mistime the page flip / sprite uploads. */
-    return pcfx_tetsu_raster_stable() >= PCFX_VBLANK_RASTER;
-}
+ * raster is independent of VDC state.
+ *
+ * WHICH rasters are blanked is pcfx_raster_in_vblank()'s business now (see
+ * platform/pcfx.h).  The local `raster >= 240` predicate that used to live here
+ * was simply wrong -- C6261's vertical timing is EVB=22/SVB=262, so 240..261
+ * are the BOTTOM OF THE PICTURE, not blanking -- and having a second, private
+ * definition of "vblank" is how it stayed wrong: the presenter, the boot panel,
+ * the device-select screen and this file each carried their own copy of the
+ * number.  There is one copy now, in pcfx.h, and it comes from the manual.
+ * pcfx_in_vblank() is the shared inline; nothing is redefined here. */
 
 /* ---------------------------------------------------- IRQ millisecond clock --
  * A hardware interval timer (CPUclk/15 = 1.4318 MHz) fires an IRQ every ~1 ms
@@ -48,15 +48,11 @@ static inline int pcfx_in_vblank(void)
 
 volatile uint32_t g_ms_irq = 0;         /* milliseconds since pcfx_time_init */
 
-/* noinline so the ISR is treated as a non-leaf and saves the full register set
- * (interrupt attribute); matches the liberis hello_interrupt pattern. */
-__attribute__((noinline)) static void tick_ms(void) { g_ms_irq++; }
-
-__attribute__((interrupt)) void pcfx_timer_irq(void)
-{
-    timer_ack_irq();
-    tick_ms();
-}
+/* The ISR itself lives in platform/pcfx_timer_irq.S. Written in C with
+ * __attribute__((interrupt)) it spilled seventeen registers around its two
+ * calls -- ~306 cycles and 160 bytes of icache thrown away 1000 times a second.
+ * The asm version needs two scratch registers and 56 bytes. */
+extern void pcfx_timer_irq(void);
 
 void pcfx_time_init(void)
 {

@@ -118,20 +118,36 @@ static const uint16_t s_font36[36] = {
  * vertical blank with enough lines left (conservative words-per-line budget);
  * otherwise it waits for the next blank RISING EDGE (full window). Bursts here
  * are at most one 128-word row, so after a fresh edge the check always passes
- * and the loop terminates. Big draws simply spread across several fields. */
-#define BLANK_FIRST_RASTER    240u  /* == PCFX_VBLANK_RASTER (pcfx_support.c)  */
-#define BLANK_LAST_RASTER     261u  /* TETSU_LINES_262: lines 240..261 blank   */
+ * and the loop terminates. Big draws simply spread across several fields.
+ *
+ * The window itself used to be spelled [240..261] here, matching a
+ * PCFX_VBLANK_RASTER of 240 in pcfx_support.c. Both were wrong the same way:
+ * C6261's vertical timing is EVB=22, SVB=262, so 240..261 is the bottom of the
+ * ACTIVE picture, and this guard -- whose whole job is to keep CPU KRAM bursts
+ * out of active display -- was steering every one of them into it. The real
+ * interval is raster 262 and 0..21: the same 22-line budget, in the right
+ * place. See pcfx_raster_in_vblank() in pcfx.h. */
 #define BLANK_WORDS_PER_LINE  64u   /* conservative CPU->KRAM words per line   */
+
+/* Lines of vertical blanking still ahead of raster `r`, or 0 if `r` is in the
+ * active picture. The counter wraps mod 262 in the 262-line mode (so raster 262
+ * is not observed) and mod 263 in the 263-line mode; the SVB branch keeps the
+ * arithmetic right if a 263-line mode is ever selected. */
+static unsigned blank_lines_left(unsigned r)
+{
+    if (r >= PCFX_VBLANK_SVB)
+        return (PCFX_VBLANK_SVB + 1u - r) + PCFX_VBLANK_EVB;
+    if (r < PCFX_VBLANK_EVB)
+        return PCFX_VBLANK_EVB - r;
+    return 0u;
+}
 
 static void bar_kram_guard(unsigned words)
 {
     for (;;) {
         unsigned r = pcfx_tetsu_raster_stable();
-        if (r >= BLANK_FIRST_RASTER && r <= BLANK_LAST_RASTER) {
-            unsigned lines_left = BLANK_LAST_RASTER + 1u - r;
-            if (lines_left * BLANK_WORDS_PER_LINE >= words)
-                return;
-        }
+        if (blank_lines_left(r) * BLANK_WORDS_PER_LINE >= words)
+            return;
         video_wait_vsync();     /* next rising edge = a full blank window */
     }
 }

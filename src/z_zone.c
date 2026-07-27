@@ -64,6 +64,29 @@
  * zone size was tuned for — still fits its whole asset pack in ONE arena chunk
  * (w_narena == 1, w_pack_loaded == 1 in a headless E1M6 warp run), so no map falls to
  * the slow scattered path. Re-check that when changing this number. */
+/* Left at 1492 KB after a 2026-07-27 attempt to grow it. DO NOT repeat that attempt
+ * without reading this first.
+ *
+ * The motivation was real: E1M6 has only ~320 KiB free at R_LitFlatLevelInit and needs
+ * to stay above a MEASURED ~199 KiB free-heap cliff (see RENDER_HEAP_FLOOR in
+ * src/r_hotpath.c) where whole-frame time jumps 50 -> 71 ms. ~34 KiB of resident image
+ * was successfully recovered -- packing state_t 28 -> 16 bytes and mobjinfo_t 92 -> 60
+ * (17.3 KiB), storing only the exactly odd-symmetric first half of finetangent[]
+ * (8 KiB), and two more -Os waves (9.8 KiB) -- and all of it was reverted, because on
+ * this port image space is NOT free to move:
+ *
+ *   change                       zone won   E1M6 ms   E1M1 ms
+ *   (baseline)                        --     50.33     65.74
+ *   finetangent half table         8 KiB    +0.76     +1.51
+ *   info.c struct packing         17 KiB    +0.05     +0.96
+ *   -Os over the per-tic files   3.2 KiB    +0.07     -0.15
+ *   -Os over load/HUD files      6.6 KiB    +0.80     +0.41
+ *
+ * Every mechanism that yields meaningful .rodata/.text pays for it in the 1 KiB
+ * instruction cache: shrinking anything relocates the cold render callers that the
+ * placed hot drawers in platform/pcfx_hot.ld were tuned against, and a full re-sweep of
+ * the five hot slots recovered only part of the loss. The cache the heap would have
+ * bought is not worth it either -- see R_LitFlatLevelInit. */
 #if defined(DEV_CD_MATRIX)
 /* Matrix self-test build: the harness adds resident code/data and the game
  * never runs, so give the link back 32 KiB.  The zone is only borrowed as

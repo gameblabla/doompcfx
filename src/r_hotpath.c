@@ -1971,12 +1971,30 @@ static void R_DrawSpanLit32(unsigned int y, unsigned int x1, unsigned int x2,
 #endif
 #define LITWALL_COLUMN_TEXELS  64u
 #define LITWALL_COLUMN_BYTES   (LITWALL_COLUMN_TEXELS * sizeof(litwall_pixel_t))
-/* The existing lit-flat cache is allocated first.  Keep a smaller margin above
- * the 180 KB gameplay-decompression reserve here so E1M6 can hold both; this
- * block is PU_CACHE and is automatically discarded if that reserve is needed. */
-#ifndef LITWALL_HEAP_FLOOR
-#define LITWALL_HEAP_FLOOR     (192u * 1024u)
+/* Free zone that must survive BOTH render caches: the decompressed working set
+ * the renderer churns during play.
+ *
+ * This is a measured cliff edge, not a guess.  A ballast sweep on E1M6
+ * (2026-07-27, permanent PU_STATIC take at R_LitFlatLevelInit, litwall pinned at
+ * 512) put whole-frame time at 50.2 ms with 222.7 KiB free, 50.2 with 198.7 --
+ * and 71.0 ms with 190.7.  It is a step, not a slope: below the edge the wall
+ * and plane phases both roughly double because lumps re-decompress mid-frame,
+ * and it stays flat at ~71 ms however much further you go.  216 KiB is the
+ * ~199 KiB edge plus a margin under one texture's worth of slack.
+ *
+ * Do not lower it to make a cache fit.  A cache is worth at most ~0.7 ms; going
+ * over this edge costs 21. */
+#ifndef RENDER_HEAP_FLOOR
+#define RENDER_HEAP_FLOOR      (216u * 1024u)
 #endif
+#ifndef LITWALL_HEAP_FLOOR
+#define LITWALL_HEAP_FLOOR     RENDER_HEAP_FLOOR
+#endif
+/* What a full-size litwall block costs, so the lit-FLAT gate can reserve it
+ * rather than grabbing the heap first and starving it (see R_LitFlatLevelInit). */
+#define LITWALL_MAX_BYTES      (LITWALL_MAX_SLOTS * LITWALL_COLUMN_BYTES + \
+                                LITWALL_MAX_SLOTS * sizeof(uint32_t) + \
+                                LITWALL_MAX_SLOTS / LITWALL_WAYS)
 /* A rapid in-place turn briefly exceeds the old 64-bake cutoff while the
  * rolling view warms, then settles around 43 bakes/frame with roughly 106
  * hits/frame on E1M6.  Disabling permanently after that transient discarded a
@@ -2109,7 +2127,16 @@ R_BakeLitWallColumn(uint32_t key, unsigned set,
     return dst;
 }
 
-static inline __attribute__((always_inline)) const litwall_pixel_t *
+/* Deliberately NOT inlined into R_DrawSegTextureColumn.  The dispatcher is
+ * placed by platform/pcfx_hot.ld into the seg loop's cache shadow, where only
+ * 194 bytes are free of R_RenderSegLoop's 830-byte generated loop; inlining
+ * this hash/tag-compare/replace body pushed the dispatcher to 0x166 bytes, so
+ * 354 of them collided with the loop and the two evicted each other once per
+ * wall column.  Out of line the dispatcher is 0x0f4 bytes: still larger than
+ * the window, but the collision drops from 354 bytes to 244, and the extra
+ * call is paid only by the ~19% of columns that miss the cache.  Worth
+ * 1.14 ms/frame on the E1M6 automove benchmark. */
+static __attribute__((noinline)) const litwall_pixel_t *
 R_GetLitWallColumn(int lump, unsigned column, const lighttable_t *cmap,
                    const byte *source)
 {
@@ -2169,11 +2196,34 @@ R_GetLitWallColumn(int lump, unsigned column, const lighttable_t *cmap,
 // clears litflat_data through the owner pointer; the next plane notices and
 // permanently falls back to the ordinary two-load span path for this level.
 // A runtime thrash guard also disables the lit path if a map's set exceeds it.
+#ifndef LITFLAT_MAX_SLOTS
 #define LITFLAT_MAX_SLOTS   64
+#endif
 #define LITFLAT_TEXELS      4096        // original 64*64 flat
-// Keep at least this much free after grabbing the cache — above the 180 KB
-// gameplay-decompress floor (w_wad.c GAMEPLAY_RESERVE), with margin.
+/* Worth having where it fits (E1M1 keeps all 64 slots), but do NOT go hunting for
+ * heap to make it fit E1M6.  Measured 2026-07-27 on the automove benchmark:
+ *   - the cache itself is worth ~0.67 ms -- E1M1 65.60 with it, 66.27 with
+ *     -DLITFLAT_FORCE_OFF.  The 15.8%-of-all-cycles pcfx_span32 profile bucket
+ *     badly overstates it.
+ *   - on E1M6 no size that fits is a win.  64 slots starve the wall cache
+ *     (57.3 ms); 56 slots + litwall 256 measured 53.1; 48 slots 54.1; 40 slots
+ *     53.0 (re-bake storm, lf_bakes 396 -> 2567); against 51.5 with it off.
+ *   - buying the heap for it by shrinking the resident image costs more than it
+ *     returns -- see the table in src/z_zone.c.
+ * Keep at least LITFLAT_HEAP_FLOOR free after grabbing it. */
+/* The lit-flat cache is allocated BEFORE the lit-wall cache, so its floor has to
+ * cover the wall block as well as the decompression reserve -- otherwise a map
+ * with just enough heap for one cache takes the flat cache (worth ~0.7 ms) and
+ * leaves the wall cache (worth far more) disabled.  That is exactly what
+ * happened on E1M6 the moment the zone grew: litflat_slots 64, litwall_slots 0,
+ * 50.2 -> 57.3 ms/frame. */
+#ifndef LITFLAT_HEAP_FLOOR
+#ifdef LITWALL_MAX_BYTES
+#define LITFLAT_HEAP_FLOOR  (RENDER_HEAP_FLOOR + LITWALL_MAX_BYTES)
+#else   /* no dense pages -> no lit-wall cache to reserve for */
 #define LITFLAT_HEAP_FLOOR  (224u * 1024u)
+#endif
+#endif
 // If a frame bakes more than this many flats, the map's working set exceeds the
 // cache (thrash). A short run of such frames disables the lit path for the level.
 #define LITFLAT_THRASH_BAKES  16
@@ -3032,6 +3082,17 @@ void R_LitFlatLevelInit(void)
     /* Allocate permanent profiler storage before the purgeable render caches;
      * a first-frame PU_STATIC allocation would otherwise evict them. */
     R_ProfileEnsureStorage();
+#endif
+#ifdef DEV_HEAP_BALLAST_KB
+    /* Measurement scaffold: permanently take DEV_HEAP_BALLAST_KB of zone right
+     * where the render caches are sized, so a sweep maps how whole-frame time
+     * responds to free heap WITHOUT changing any renderer code path.  Only ever
+     * compiled into a bench build. */
+    {
+        static void *ballast;
+        if (!ballast && DEV_HEAP_BALLAST_KB > 0)
+            ballast = Z_Malloc(DEV_HEAP_BALLAST_KB * 1024, PU_STATIC, NULL);
+    }
 #endif
     if (litflat_data)
         Z_Free(litflat_data);

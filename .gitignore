@@ -34,3 +34,6 @@ assets/*.wad
 # Neither is source, and buildid.h by construction changes with every commit.
 src/generated/buildid.h
 src/generated/cdmatrix_ref.h
+
+tools/__pycache__/
+tools/pcfx-cdlink

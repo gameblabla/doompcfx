@@ -37,15 +37,18 @@
 #include "pcfx_save.h"
 #include "pcfx_text.h"
 #include "v_video.h"        /* V_SetPalette: upload PLAYPAL so the font shows red */
+#include "pcfx_time.h"      /* video_wait_vsync */
 
-/* Active display is lines 0..239 in the 262-line mode; vblank is raster >= 240. */
-#define PCFX_VBLANK_RASTER 240
-
-/* Wait one full frame: leave vblank, then re-enter it. */
+/* Wait one full frame: leave vblank, then re-enter it. That is exactly what
+ * video_wait_vsync() (platform/pcfx_support.c) does, and it is spelled that way
+ * now instead of being open-coded against a local "vblank is raster >= 240"
+ * constant. That constant was wrong -- C6261's vertical timing is EVB=22,
+ * SVB=262, so 240..261 are the bottom of the PICTURE (see
+ * pcfx_raster_in_vblank() in pcfx.h) -- and these two loops were also unbounded,
+ * so a wedged VCE hung the chooser rather than merely mispacing it. */
 static void wait_frame(void)
 {
-    while (pcfx_tetsu_raster_stable() >= PCFX_VBLANK_RASTER) { }
-    while (pcfx_tetsu_raster_stable() <  PCFX_VBLANK_RASTER) { }
+    video_wait_vsync();
 }
 
 /* Black out the visible KING framebuffer page 0 (the page shown throughout boot),

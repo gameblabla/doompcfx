@@ -59,22 +59,26 @@ CFLAGS    := -O2 -fomit-frame-pointer -fno-builtin -ffunction-sections \
 
 # Link with v810-ld directly: toolchain crt0.o first, default v810.x script
 # (load 0x8000, heap up to 2 MB), then --gc-sections to drop unused engine code.
-# These offsets are cache indices within the 1 KiB-aligned renderer section.
-# They are deliberately build knobs: after changing a hot function, inspect the
-# result with `make pcfx-hot-layout` and re-benchmark candidate placements without
-# editing C or the linker script.  The script retains the measured defaults.
+# These offsets are cache indices within the 1 KiB-aligned renderer section
+# (platform/pcfx_hot.ld keeps only their low 10 bits and auto-advances "."
+# to the next address with that cache index, so the section auto-shrinks/
+# grows as the routines' compiled sizes change -- no core_end padding knob
+# needed anymore). They are deliberately build knobs: after changing a hot
+# function, inspect the result with `make pcfx-hot-layout` and re-benchmark
+# candidate placements without editing C or the linker script.  The script
+# retains the measured defaults.
+# Re-measured 2026-07-27 on the E1M6 automove benchmark (see the per-slot
+# comments in platform/pcfx_hot.ld for what each index is avoiding).
 PCFX_HOT_RENDERSEG_OFFSET     ?= 0x200
 PCFX_HOT_SPAN_LIT_OFFSET      ?= 0xa40
-PCFX_HOT_COLUMN_LIT_OFFSET    ?= 0xb04
+PCFX_HOT_COLUMN_LIT_OFFSET    ?= 0xafc
 PCFX_HOT_WALL_DISPATCH_OFFSET ?= 0xda0
-PCFX_HOT_CORE_END_OFFSET      ?= 0x10e0
-PCFX_HOT_SPAN32_OFFSET        ?= 0x1454
+PCFX_HOT_SPAN32_OFFSET        ?= 0x1158
 PCFX_HOT_LAYOUT_LDFLAGS := \
              --defsym=__pcfx_renderseg_offset=$(PCFX_HOT_RENDERSEG_OFFSET) \
              --defsym=__pcfx_span_lit_offset=$(PCFX_HOT_SPAN_LIT_OFFSET) \
              --defsym=__pcfx_column_lit_offset=$(PCFX_HOT_COLUMN_LIT_OFFSET) \
              --defsym=__pcfx_walldispatch_offset=$(PCFX_HOT_WALL_DISPATCH_OFFSET) \
-             --defsym=__pcfx_hot_core_end_offset=$(PCFX_HOT_CORE_END_OFFSET) \
              --defsym=__pcfx_span32_offset=$(PCFX_HOT_SPAN32_OFFSET)
 LDFLAGS   := -L$(LIBPCFX) \
              -L$(V810)/lib -L$(V810)/v810/lib -L$(V810)/lib/gcc/v810/4.9.4 \

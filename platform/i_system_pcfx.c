@@ -181,14 +181,16 @@ static __attribute__((noinline)) void pcfx_palette_flush(void)
     pcfx_irq_restore(psw);
 }
 
-/* Initialization has no presenter poll to drain the staged blackout. */
+/* Initialization has no presenter poll to drain the staged blackout.
+ *
+ * video_wait_vsync() (platform/pcfx_support.c) rather than a hand-rolled spin
+ * onto a raster range: it waits for the LEADING edge of the interval, so the
+ * 256-entry burst gets the whole of it. The old loop targeted [240..258], which
+ * is not blanking at all (pcfx.h), and would also accept an entry point at 258
+ * with nothing left to spend. */
 static void pcfx_palette_flush_in_blank(void)
 {
-    uint32_t spin = 0;
-    unsigned r;
-    do {
-        r = pcfx_tetsu_raster_stable();
-    } while ((r < 240u || r > 258u) && spin++ < 400000u);
+    video_wait_vsync();
     pcfx_palette_flush();
 }
 
@@ -597,25 +599,41 @@ static void rainbow_stop(void)
 }
 
 /* One arm per field: none leaves the layer blank for that field, two costs KRAM
- * bandwidth in vblank for nothing. Set when an arm goes out, cleared when the
- * raster is next seen inside the visible area (i.e. a new field has begun). */
+ * bandwidth for nothing. "A new field has begun" is detected from the raster
+ * counter WRAPPING (a lower value than the last one seen) rather than from
+ * observing it below RAINBOW_RESTART_RASTER. This is polled, not
+ * interrupt-driven, so requiring a poll inside a particular sub-range to clear
+ * the flag is a race the wrap test does not have: any two polls that straddle a
+ * field boundary see it. */
 static int s_rb_armed_field = 0;
+static unsigned s_rb_last_raster = 0;
 
 /* The window in which an arm is both safe and effective: from the raster at
- * which this field's transfer has finished, to the end of the field. */
+ * which this field's transfer has finished, to the end of the field.
+ *
+ * NOT widenable, and in particular not movable into the real blanking interval
+ * that everything else in this file just moved into. The sky's transfer start
+ * raster is PCFX_SKY_TRANSFER_START (6), and the HuC6271 does not decode the
+ * stream in one burst there -- it decodes progressively down the field to feed
+ * the layer. rainbow_rearm() opens with REG.40 = 0, so an arm issued before
+ * that decode has finished aborts it and the rest of the field loses its sky.
+ * (Measured in the sibling wolf-pcfx port, whose floor layer is the same
+ * mechanism: moving the lower bound to 60 blacked out the ceiling band and the
+ * far floor.) 248 is where the decode is reliably done. */
 #define RAINBOW_REARM_LAST_RASTER 261u
 
 /* Re-arm for the coming field if the raster is in the window and this field has
  * not been armed yet. NEVER spins -- it is called from the render-phase poll
  * sites, where blocking would cost frame time; a field whose window is missed
- * simply gets its arm from the presenter's own spin instead. */
+ * simply goes un-armed. */
 static void rainbow_poll_rearm(unsigned raster)
 {
-    if (raster < RAINBOW_RESTART_RASTER) {
-        s_rb_armed_field = 0;         /* visible area: a new field has begun */
-        return;
-    }
-    if (s_rb_armed_field || raster > RAINBOW_REARM_LAST_RASTER)
+    if (raster < s_rb_last_raster)
+        s_rb_armed_field = 0;         /* counter wrapped: a new field began */
+    s_rb_last_raster = raster;
+
+    if (s_rb_armed_field ||
+        raster < RAINBOW_RESTART_RASTER || raster > RAINBOW_REARM_LAST_RASTER)
         return;
     rainbow_rearm();
     s_rb_armed_field = 1;
@@ -630,84 +648,88 @@ static void rainbow_poll_rearm(unsigned raster)
  * from the tic wait loop and between rendered subsectors/visplanes/sprites —
  * performs the presentation the moment the raster is inside the safe window:
  *
- *   lines 208..239: the flip is invisible (BG0 rows 208..239 sit behind the
- *                   opaque VDC HUD tiles; everything >= 240 is vblank);
- *   line  240:      the VDCs' repeated SATB DMA latched at the VDW transition,
- *                   so a SAT published after it can never be half-latched;
- *   line  248:      the RAINBOW finished this field's transfer; KING regs
- *                   0x40..44 may be re-armed for the next field.
+ *   line  248..261: the RAINBOW finished this field's transfer; KING regs
+ *                   0x40..44 may be re-armed for the next field;
+ *   raster 262,0..21: VERTICAL BLANKING (C6261 EVB=22/SVB=262) -- where the
+ *                   page flip, the VCE palette burst and the VDC uploads go.
  *
- * The poll flips (>= 208), spins the short remaining distance to 248
- * (<= 40 lines ~ 2.6 ms worst, typically well under 1 ms), re-arms the
- * RAINBOW, then runs the VDC weapon/text uploads — the classic presenter's
- * exact order and raster placement, minus the up-to-a-full-field wait for
- * vblank to come around, which is what turned a small render overrun into a
- * whole extra field on the 1%-low frames (see MICRO-OPT-NEXT-STEPS.md "two
- * field locks": both locks are removed here, keeping the hardware sky). A
- * frame that misses every window is caught by pcfx_present_flush() at the
- * next I_FinishUpdate, degrading to exactly the old synchronous cost. */
+ * That second line used to read "lines 208..239: the flip is invisible (BG0
+ * rows 208..239 sit behind the opaque VDC HUD tiles; everything >= 240 is
+ * vblank)". Nothing >= 240 is vblank: per C6261's own vertical timing the
+ * active image runs to raster 261, so the whole [208..258] action window was
+ * active display, and the flip, the KING page/CG/affine reassert and the
+ * palette burst were all being issued mid-picture. See pcfx_raster_in_vblank()
+ * in platform/pcfx.h for the derivation, the three manual clauses that forbids,
+ * and why pcfxemu shows none of it. Hiding a torn BG0 raster behind the opaque
+ * status bar does not cover any of it either: REG.0F is vblank-only regardless
+ * of what is composited on top, and VCE palette noise is a whole-output effect
+ * that the HUD tiles share the palette with.
+ *
+ * So the poll now arms the sky in [248..261] (unchanged -- see
+ * rainbow_poll_rearm) and does everything else in the real interval, ordered
+ * shortest-deadline-first with the raster re-read between steps. The
+ * present_spin_to() climb from the flip up to 248 is gone with it: the flip now
+ * happens AFTER this field's arm window rather than before it, so there is
+ * nothing left to climb to, which also deletes up to 40 lines of blocking from
+ * the present path (MICRO-OPT-NEXT-STEPS.md "two field locks"). A frame that
+ * misses every window is caught by pcfx_present_flush() at the next
+ * I_FinishUpdate, degrading to exactly the old synchronous cost. */
 #if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
 extern uint32_t g_bl_vsync, g_bl_upload, g_bl_rearm;
 #endif
-
-static void present_spin_to(unsigned raster)
-{
-    uint32_t spin = 0;
-    while (pcfx_tetsu_raster_stable() < raster && spin++ < 200000u) { }
-}
 
 void pcfx_present_poll(void)
 {
     unsigned r = pcfx_tetsu_raster_stable();
 
-    /* C6261 2.1.3 (5): palette DATA writes belong in vertical blanking. The
-     * precomputed 256-entry burst takes only a few scanlines against this
-     * 19-line window. */
-    if (g_pcfx_palette_pend && r >= 240u && r <= 258u)
-        pcfx_palette_flush();
-
     /* Field-rate work first, and unconditionally: the sky must be re-armed on
      * every field, not on every presented frame (see g_pcfx_rainbow_pend in
      * pcfx_present.h). This is why the poll no longer returns early on
      * !g_pcfx_present_pend -- that gate is what limited the sky to the fields
-     * a flip happened to land in. */
+     * a flip happened to land in. Its window is the tail of ACTIVE display,
+     * which is legal for these registers -- see the block comment above. */
     if (g_pcfx_rainbow_pend)
         rainbow_poll_rearm(r);
 
-    if (!g_pcfx_present_pend)
+    if (!pcfx_raster_in_vblank(r))
         return;
 
-    /* Act only inside [208..258]: early enough that the flip and the SAT
-     * publish still land in this vblank, late enough to be tear-safe. */
-    if (r < 208u || r > 258u)
-        return;
-
-    king_set_display_page(s_pend_buf);
-    s_pend_buf = -1;
-    g_pcfx_present_pend = 0;
-
-    {
-        /* Only spin for the arm if this field has not already had one from the
-         * field-rate path above -- which, now that it runs, is the common case. */
-        int want_rearm = s_rainbow_active && !s_rb_armed_field;
-#ifdef DEV_RB_NO_REARM
-        want_rearm = 0;
-#endif
-        if (want_rearm) {
-#if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
-            uint64_t _tr = itu_ticks();
-#endif
-            present_spin_to(RAINBOW_RESTART_RASTER);
-            rainbow_rearm();
-            s_rb_armed_field = 1;
-#if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
-            g_bl_rearm += (uint32_t)(itu_ticks() - _tr);
-#endif
-        } else {
-            /* No sky to re-arm: still publish the SAT after this field's latch. */
-            present_spin_to(240u);
-        }
+    /* The page flip goes first. It is short (a dozen KING select/data pairs)
+     * and it is the one step with a hard deadline inside the interval: REG.0F
+     * is vblank-only (C6272_1 (23)) and the CG base / affine reassert are
+     * immediate-effect registers that visibly disturb whatever raster they land
+     * on (C6272_2 3.6.6). Doing it before the variable-length palette and VDC
+     * work means a long burst can never push it back out into the picture,
+     * which is what the old ordering did. */
+    if (g_pcfx_present_pend) {
+        king_set_display_page(s_pend_buf);
+        s_pend_buf = -1;
+        g_pcfx_present_pend = 0;
     }
+
+    /* Then the staged VCE palette. C6261 2.1.3 (5): palette RAM writes during
+     * display put noise on screen, so this has to be inside the interval too --
+     * and it is the burst that actually threatens to outlast it (a damage,
+     * pickup or radiation-suit tint restages all 256 entries at once).
+     *
+     * RE-READ the raster instead of reusing `r`. `r` was sampled before the
+     * flip, and on hardware every KING access costs real time; carrying a stale
+     * raster across a variable-length step is how the old body could believe it
+     * was still in its window when the beam had already left it. */
+    if (g_pcfx_palette_pend) {
+        if (!pcfx_raster_in_vblank(pcfx_tetsu_raster_stable()))
+            return;
+        pcfx_palette_flush();
+    }
+
+    /* Finally the VDC pattern/SAT publish. Last because it is by far the
+     * longest (a changed weapon frame streams thousands of halfwords) and the
+     * only step designed to survive overrunning: pcfx_weapon_present() uploads
+     * into the INACTIVE pattern bank and publishes the SAT naming it only once
+     * both planes are complete, so a missed SATB latch just repeats the
+     * previous coherent pair for one field. */
+    if (!pcfx_raster_in_vblank(pcfx_tetsu_raster_stable()))
+        return;
 
 #if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
     {
@@ -1301,48 +1323,16 @@ void I_FinishUpdate_e32(const byte *srcBuffer, const byte *pallete,
     uint64_t _tv = itu_ticks();
 #endif
 #ifndef DEV_NO_PRESENT_VSYNC
-    /* DEV_NO_PRESENT_VSYNC measures what triple buffering is worth WITHOUT a
-     * third buffer.  Skipping the wait flips BG0's CG base mid-scanline: the
-     * lines already scanned came from the old page and the rest come from the
-     * new one, so it costs a tear line but frees the old page immediately --
-     * exactly the vsync-quantization saving a third buffer would buy, and the
-     * fps is identical.  Tearing is not shippable; this is an oracle for
-     * pricing the no-tear version before paying for it. */
-    video_wait_present_vsync();
-    /* video_wait_present_vsync may reuse a blank already at its very end.
-     * A full palette needs a few lines, so wait for the next leading edge. */
-    if (g_pcfx_palette_pend && pcfx_tetsu_raster_stable() > 258u)
-        video_wait_vsync();
-#else
-    /* The tearing oracle may arrive during active display; leave a staged
-     * palette for a later safe poll instead of adding VCE noise to the test. */
-    {
-        unsigned r = pcfx_tetsu_raster_stable();
-        if (r >= 240u && r <= 258u)
-            pcfx_palette_flush();
-    }
-#endif
-#if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
-    {
-        uint32_t _spin = (uint32_t)(itu_ticks() - _tv);
-        g_bl_vsync += _spin;
-#ifdef DEV_FRAME_TRACE_WORK
-        g_rp_vsync = _spin;
-#endif
-    }
-#endif
-#ifndef DEV_NO_PRESENT_VSYNC
-    pcfx_palette_flush();
-#endif
-    king_set_display_page(page);       /* tear-free: latch in vblank */
-
+    /* ORDER: sky arm, THEN vblank. The arm window ([248..261], see
+     * rainbow_poll_rearm) sits just BEFORE the blanking interval within a
+     * field, so taking it first is a short forward spin from wherever the frame
+     * ended and leaves the interval itself entirely for the flip and the
+     * palette. Doing it the other way round -- which is what this path did
+     * while it believed blanking started at 240 -- now costs a ~230-line climb
+     * back round to 248, i.e. exactly the ~15 ms/frame wrap the comment that
+     * used to sit below the flip was written to avoid. */
 #ifndef DEV_RB_NO_REARM
-    /* Re-arm the RAINBOW for the next field at the bottom raster (~248). This runs
-     * FIRST, right after the vsync — the raster is at ~240 (start of vblank), so
-     * the wait to 248 is only ~8 lines (~0.5 ms). Doing it AFTER the VDC uploads
-     * (as before) let the ~2 ms of upload advance the raster past 248 and wrap it,
-     * forcing a ~234-line (~15 ms/frame!) spin to climb back round to 248. */
-    if (s_rainbow_active)
+    if (s_rainbow_active && !s_rb_armed_field)
     {
 #if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
         uint64_t _tr = itu_ticks();
@@ -1359,6 +1349,48 @@ void I_FinishUpdate_e32(const byte *srcBuffer, const byte *pallete,
 #endif
     }
 #endif
+
+    /* DEV_NO_PRESENT_VSYNC measures what triple buffering is worth WITHOUT a
+     * third buffer.  Skipping the wait flips BG0's CG base mid-scanline: the
+     * lines already scanned came from the old page and the rest come from the
+     * new one, so it costs a tear line but frees the old page immediately --
+     * exactly the vsync-quantization saving a third buffer would buy, and the
+     * fps is identical.  Tearing is not shippable; this is an oracle for
+     * pricing the no-tear version before paying for it. */
+    video_wait_present_vsync();
+    /* video_wait_present_vsync accepts a blank already in progress, which may
+     * be at its very end. A 256-entry burst needs a few lines of the 22 there
+     * are, so if fewer than half of them are left, take a fresh leading edge
+     * instead of starting a burst that would run out into the picture. */
+    if (g_pcfx_palette_pend) {
+        unsigned r = pcfx_tetsu_raster_stable();
+        if (r < PCFX_VBLANK_SVB && r >= PCFX_VBLANK_EVB / 2u)
+            video_wait_vsync();
+    }
+#else
+    /* The tearing oracle may arrive during active display; leave a staged
+     * palette for a later safe poll instead of adding VCE noise to the test. */
+    if (pcfx_in_vblank())
+        pcfx_palette_flush();
+#endif
+#if defined(SERIAL_LOG) || defined(COARSE_RENDER_PROFILE)
+    {
+        uint32_t _spin = (uint32_t)(itu_ticks() - _tv);
+        g_bl_vsync += _spin;
+#ifdef DEV_FRAME_TRACE_WORK
+        g_rp_vsync = _spin;
+#endif
+    }
+#endif
+#ifndef DEV_NO_PRESENT_VSYNC
+    pcfx_palette_flush();
+#endif
+    king_set_display_page(page);       /* tear-free: latch in real vblank now */
+
+    /* (The RAINBOW re-arm used to sit here, after the flip, spinning up to
+     * raster 248. It now runs BEFORE the vblank wait above -- see the ORDER
+     * note there. Same one arm per field, but reached by a short forward spin
+     * instead of a wrap all the way round the field.) */
 
     /* Flush the VDC weapon sprites, still inside vblank / at the top of the frame,
      * well before the beam reaches the bottom-of-screen weapon — so the pattern

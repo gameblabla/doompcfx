@@ -72,6 +72,60 @@ static inline unsigned pcfx_tetsu_raster_stable(void)
     return a;
 }
 
+/* ---- Where vertical blanking actually is -----------------------------------
+ * HuC6261 manual C6261, "Vertical timing": `EVB=22, SVB=262` -- End of Vertical
+ * Blank is internal raster 22 and Start of Vertical Blank is 262. The same
+ * section states "the active image begins around internal raster 22-24 and ends
+ * around 259-261" and "the active region is 240 rasters x 256 dots". So in the
+ * 262-line mode this port programs (TETSU_LINES_262):
+ *
+ *     VERTICAL BLANKING = raster 262 and 0..21   (22 lines)
+ *     ACTIVE DISPLAY    = raster 22..261         (240 lines)
+ *
+ * and the counter's own display-period bit (port 0x300 d15, C6261 2.1.3: "0 =
+ * blanking/non-display period") agrees -- it is clear exactly for raster < 22
+ * (and 262), plus every hblank.
+ *
+ * This port used to treat "raster >= 240" as vblank and did the page flip, the
+ * KING BG0 page/CG/affine reassert, the VCE palette burst and the VDC weapon/
+ * text uploads inside a [240..258] "window". That window is not blanking at
+ * all: rasters 240..258 are ACTIVE DISPLAY lines, specifically screen rows
+ * 218..236 -- the bottom of the picture, over the status bar and the lower edge
+ * of the weapon sprite. So every one of those accesses was made mid-picture,
+ * which is precisely what the hardware manuals forbid:
+ *   - C6261 2.1.3 (5)/(6) and 6.x: "perform palette RAM reads and writes only
+ *     during blanking; active-display access causes screen noise" -- the damage,
+ *     pickup and radiation-suit tints rewrite all 256 entries at once.
+ *   - C6272_1 (23) REG.0F: the KRAM page assignment may only change in vertical
+ *     blanking.
+ *   - C6272_2 3.6.6: an immediate-effect register written during the display
+ *     period disturbs THAT raster -- which covers BG0's CG base, priority
+ *     REG.12 and the affine coefficients REG.38..3D, all reasserted per flip.
+ * pcfxemu models none of this (it has no palette-noise model and applies KING
+ * register writes instantly), which is exactly why the resulting glitch bands
+ * show up only on real hardware, and only on the frames that flash or fade.
+ * The same defect was diagnosed and fixed first in the sibling wolf-pcfx port,
+ * whose presenter was vendored from this one.
+ *
+ * The Hudson documents are the authority here over the emulator, so the numbers
+ * below come from them. Kept as one definition because every raster-timed site
+ * in the port has to agree on it. */
+#define PCFX_VBLANK_SVB     262u   /* C6261 SVB: first blanked raster          */
+#define PCFX_VBLANK_EVB      22u   /* C6261 EVB: first displayed raster        */
+
+/* True while the raster is in VERTICAL blanking. The counter wraps mod 262 in
+ * the 262-line mode (so 262 itself is not observed) and mod 263 in the 263-line
+ * mode; testing both ends keeps this correct either way. */
+static inline int pcfx_raster_in_vblank(unsigned r)
+{
+    return r >= PCFX_VBLANK_SVB || r < PCFX_VBLANK_EVB;
+}
+
+static inline int pcfx_in_vblank(void)
+{
+    return pcfx_raster_in_vblank(pcfx_tetsu_raster_stable());
+}
+
 /* ---- interrupt-atomic KING access -----------------------------------------
  * Silicon-verified (maka/tank3d hardware bring-up, fix2_irq_atomic_king +
  * libpcfx probes 027-029, on the same real hardware this port targets): a
