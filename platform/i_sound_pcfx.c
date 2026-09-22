@@ -29,6 +29,7 @@
 #include "pcfx_time.h"    /* g_ms_irq: the IRQ ms clock voices are timed against */
 #include "pcfx_boot.h"    /* pcfx_boot_progress_tick: boot-bar nudge for this read */
 #include "pcfx_sfx.h"      /* generated: pcfx_sfx_meta[], counts (bank is on the CD) */
+#include "pcfx_sky.h"      /* generated: sector-rounded sky/SFX overlap check */
 #include "i_system_e32.h" /* engine prototypes shared with the sound backend */
 
 /* The ADPCM bank is a CD asset (cdlink `append`s pcfx_sfx.bin) so it is NOT baked
@@ -106,7 +107,7 @@ static uint16_t ctrl_keep(int ch)
 }
 
 /* The bank is ONE contiguous run in KRAM page-1 BANK A, words
- * PCFX_SFX_KRAM_BASE_WORD (0x02000, past the sky reserve) .. 0x1FFFF.
+ * PCFX_SFX_KRAM_BASE_WORD .. 0x1FFFF, anchored at the top and sector-aligned.
  *
  * It was briefly split in two to skip words 0x10000..0x1FFFF, which read back
  * as open bus (0x5555) on the 2026-07-24 burns and turned 44% of the audio into
@@ -123,11 +124,12 @@ static uint16_t ctrl_keep(int ch)
  *
  * Negative-array idiom, not _Static_assert: gnu99 with GCC 4.9.4. */
 typedef char pcfx_sfx_bank_fits_kram_page1[
-    (PCFX_SFX_KRAM_BASE_WORD + (PCFX_SFX_BANK_BYTES + 1u) / 2u
+    (PCFX_SFX_KRAM_BASE_WORD + ((PCFX_SFX_BANK_BYTES + 2047u) & ~2047u) / 2u
          <= PCFX_SFX_BANK_END_WORD) ? 1 : -1];
-/* The sky stream must still fit under the bank base. */
+/* Both CD loads round up to whole sectors; compare extents, not just bases. */
 typedef char pcfx_sky_fits_below_adpcm[
-    (KRAM_RAINBOW_WORD < PCFX_SFX_KRAM_BASE_WORD) ? 1 : -1];
+    (KRAM_RAINBOW_WORD + ((PCFX_SKY_BYTES + 2047u) & ~2047u) / 2u
+         <= PCFX_SFX_KRAM_BASE_WORD) ? 1 : -1];
 
 /* Programming a voice is a RUN of KING 0x600/0x604 register-select/data pairs,
  * and by the rule in pcfx.h every such run must be interrupt-atomic: a firing

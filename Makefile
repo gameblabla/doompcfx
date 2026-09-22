@@ -335,7 +335,7 @@ SFX_WAD := $(if $(wildcard $(DOOM1WAD)),$(DOOM1WAD),$(IWAD_SRC))
 # The raw ADPCM bank is a CD asset (see `append` in cdlink.txt) DMA'd to KRAM at
 # boot, NOT baked into the RAM image — that reclaims ~80 KB of .rodata for the
 # zone heap (needed so a whole level's graphics stay resident, no in-game CD).
-$(SFX_H) $(SFX_BIN): tools/gen_pcfx_sfx.py src/sounds.c
+$(SFX_H) $(SFX_BIN) &: tools/gen_pcfx_sfx.py src/sounds.c $(SFX_WAD)
 	@mkdir -p src/generated
 	python3 tools/gen_pcfx_sfx.py $(SFX_WAD) src/sounds.c $(SFX_H) $(SFX_BIN)
 $(OBJDIR)/platform/i_sound_pcfx.o: $(SFX_H)
@@ -345,10 +345,15 @@ $(OBJDIR)/platform/i_sound_pcfx.o: $(SFX_H)
 # and DMA'd into KRAM at runtime (the HuC6271 only decodes CD-DMA'd KRAM data).
 SKY_H   := src/generated/pcfx_sky.h
 SKY_BIN := src/generated/pcfx_sky.bin
-$(SKY_H) $(SKY_BIN): tools/gen_pcfx_sky.py tools/gen_pcfx_rainbow_bg.py
+RAINBOW_SCALE ?= auto
+RAINBOW_MAX_STRIP_BYTES ?= 0
+# Use -B on $(SKY_H) when changing the rate/guard without changing sources.
+$(SKY_H) $(SKY_BIN) &: tools/gen_pcfx_sky.py tools/gen_pcfx_rainbow_bg.py tools/gen_pcfx_sfx.py $(SFX_H) $(SFX_WAD) Makefile
 	@mkdir -p src/generated
-	python3 tools/gen_pcfx_sky.py $(SFX_WAD) $(SKY_H)
+	python3 tools/gen_pcfx_sky.py $(SFX_WAD) $(SKY_H) --sfx-header $(SFX_H) \
+	  --rainbow-scale $(RAINBOW_SCALE) --rainbow-max-strip-bytes $(RAINBOW_MAX_STRIP_BYTES)
 $(OBJDIR)/platform/i_system_pcfx.o: $(SKY_H)
+$(OBJDIR)/platform/i_sound_pcfx.o: $(SKY_H)
 
 # VDC 256-colour weapon sprites: doom1.wad psprite frames -> PNGs (for
 # inspection) + generated pattern/palette/frame tables. Needs the full IWAD for
